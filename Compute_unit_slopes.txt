@@ -1,0 +1,174 @@
+#This script reads the per‑unit/channel mean CSVs (produced by normalised_thermal_excursions.py), 
+#fits a simple linear model of normalised brightness temperature (T_norm) 
+#versus representative depths for each unit, and outputs a consolidated table (unit_aggregates.csv). 
+#This table is the basis for the bootstrap resampling and correlation analyses described later in the paper.
+
+#This script is the bridge between raw zonal means and the statistical analyses in the paper.
+#It formalises the slope metric, ensuring reproducibility.
+#The output table is the dataset used for correlation plots and bootstrap resampling.
+
+#ANNOTATED CODE EXCERPT
+
+# ---------------- USER PARAMETERS ----------------
+# Either set INPUT_CSV to a single consolidated CSV,
+# or set INPUT_FOLDER to read all *_zonal_means.csv
+INPUT_CSV = ""  
+INPUT_FOLDER = r"ZonalStats"
+OUTPUT_CSV = "unit_aggregates.csv"
+
+# Column names expected in the zonal CSVs
+UNIT_ID_COL = "FID"   # zone id column
+CHANNEL_COLS = {
+    "3": "Mean_3GHz",
+    "7": "Mean_7GHz",
+    "19": "Mean_19GHz",
+    "37": "Mean_37GHz"
+}
+
+# Representative depths (metres) for each channel
+DEPTHS = {
+    "3": 1.25,
+    "7": 0.30,
+    "19": 0.10,
+    "37": 0.02
+}
+
+# Optional auxiliary parameters to merge into output
+AUXILIARY_CSV = ""  
+
+# Minimum number of valid channels required to compute a slope
+MIN_VALID_CHANNELS = 2
+
+
+
+#RAW CODE
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+
+# ---------------- USER PARAMETERS ----------------
+# Either set INPUT_CSV to a single consolidated CSV, or set INPUT_FOLDER to read all *_zonal_means.csv
+INPUT_CSV = ""  # e.g., "ZonalStats/all_units_zonal_means.csv"
+INPUT_FOLDER = r"ZonalStats"  # folder containing per-transect CSVs (used if INPUT_CSV == "")
+OUTPUT_CSV = "unit_aggregates.csv"
+
+# Column names expected in the zonal CSVs (adjust if your headers differ)
+UNIT_ID_COL = "FID"               # zone id column in zonal CSVs
+CHANNEL_COLS = {
+    "3": "Mean_3GHz",
+    "7": "Mean_7GHz",
+    "19": "Mean_19GHz",
+    "37": "Mean_37GHz"
+}
+
+# Representative depths (metres) for each channel (edit if needed)
+DEPTHS = {
+    "3": 1.25,
+    "7": 0.30,
+    "19": 0.10,
+    "37": 0.02
+}
+
+# Optional: path to auxiliary parameters CSV to merge into output (one row per UNIT_ID)
+AUXILIARY_CSV = ""  # e.g., "auxiliary_parameters.csv" or leave empty to skip
+
+# Minimum number of valid channels required to compute a slope
+MIN_VALID_CHANNELS = 2
+
+# -------------------------------------------------
+
+def read_input_table():
+    if INPUT_CSV:
+        if not os.path.exists(INPUT_CSV):
+            raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
+        df = pd.read_csv(INPUT_CSV)
+        return df
+    else:
+        pattern = os.path.join(INPUT_FOLDER, "*_zonal_means.csv")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"No zonal CSVs found in folder: {INPUT_FOLDER}")
+        dfs = []
+        for f in files:
+            d = pd.read_csv(f)
+            # Ensure UNIT_ID column exists
+            if UNIT_ID_COL not in d.columns:
+                # try common alternatives
+                for alt in ["FID", "OBJECTID", "OID", "Id", "ID"]:
+                    if alt in d.columns:
+                        d = d.rename(columns={alt: UNIT_ID_COL})
+                        break
+            dfs.append(d)
+        # Concatenate and drop duplicate rows (if same unit appears in multiple transects)
+        df = pd.concat(dfs, ignore_index=True, sort=False)
+        df = df.drop_duplicates(subset=[UNIT_ID_COL])
+        return df
+
+def compute_slope_for_row(row):
+    vals = []
+    depths = []
+    for ch, col in CHANNEL_COLS.items():
+        v = row.get(col, np.nan)
+        if pd.notnull(v):
+            vals.append(float(v))
+            depths.append(float(DEPTHS[ch]))
+    if len(vals) < MIN_VALID_CHANNELS:
+        return (np.nan, np.nan, int(len(vals)), np.nan)  # slope, intercept, n_valid, r2
+    # Fit linear model: T_norm = m * depth + b
+    x = np.array(depths)
+    y = np.array(vals)
+    # Use numpy.polyfit (degree 1)
+    try:
+        p = np.polyfit(x, y, 1)
+        m = float(p[0])
+        b = float(p[1])
+        # compute R^2
+        yhat = m * x + b
+        ss_res = np.sum((y - yhat)**2)
+        ss_tot = np.sum((y - np.mean(y))**2)
+        r2 = float(1 - ss_res/ss_tot) if ss_tot > 0 else np.nan
+    except Exception:
+        m, b, r2 = np.nan, np.nan, np.nan
+    return (m, b, int(len(vals)), r2)
+
+def main():
+    df = read_input_table()
+    # Ensure channel columns exist in df; if not, create with NaN
+    for col in CHANNEL_COLS.values():
+        if col not in df.columns:
+            df[col] = np.nan
+
+    out_rows = []
+    for _, row in df.iterrows():
+        unit_id = row.get(UNIT_ID_COL)
+        slope, intercept, n_valid, r2 = compute_slope_for_row(row)
+        out = {
+            UNIT_ID_COL: unit_id,
+            "TBDeff_slope": slope,
+            "TBDeff_intercept": intercept,
+            "n_valid_channels": n_valid,
+            "slope_r2": r2
+        }
+        # copy per-channel means into output
+        for ch, col in CHANNEL_COLS.items():
+            out[col] = row.get(col, np.nan)
+        out_rows.append(out)
+
+    out_df = pd.DataFrame(out_rows)
+    # Optionally merge auxiliary parameters
+    if AUXILIARY_CSV:
+        if not os.path.exists(AUXILIARY_CSV):
+            raise FileNotFoundError(f"Auxiliary CSV not found: {AUXILIARY_CSV}")
+        aux = pd.read_csv(AUXILIARY_CSV)
+        if UNIT_ID_COL not in aux.columns:
+            raise KeyError(f"Auxiliary CSV must contain the unit id column '{UNIT_ID_COL}'")
+        out_df = out_df.merge(aux, on=UNIT_ID_COL, how="left")
+
+    # Save output
+    out_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Wrote {len(out_df)} units to {OUTPUT_CSV}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,201 @@
+#This script normalises four TBDeff rasters (3, 7, 19, 37 GHz) 
+#to make them comparable across channels. It uses robust statistics 
+#(median and median absolute deviation, MAD) 
+#rather than mean and standard deviation, 
+#which ensures resilience to outliers and noise. 
+#The output is a set of normalised rasters plus optional masks flagging extreme values
+
+"""
+#CODE WALKTHROUGH: NORMALISATION OF DEBDEFF RASTERS
+
+normalize_tbdeff.py
+
+Compute robust per-channel normalisation (median / MAD) for TBDeff rasters
+and write normalized rasters TBDeff_*_norm.tif plus an optional extreme mask.
+
+Requirements:
+ - ArcGIS Pro / ArcPy (Python 3.x)
+ - Spatial Analyst extension
+
+Edit the USER PARAMETERS section below to match your paths and filenames.
+"""
+
+import arcpy
+import os
+import numpy as np
+from arcpy import env
+from arcpy.sa import Con
+
+# ------------------ USER PARAMETERS ------------------
+# Workspace and overwrite settings
+env.workspace = r"F:\ArcProjects\Tranquillitatis"
+env.overwriteOutput = True
+
+# Input TBDeff rasters (paths to each frequency channel)
+input_rasters = {
+    "3GHz":  r"F:\ArcProjects\Tranquillitatis\TBDeff_3.tif",
+    "7GHz":  r"F:\ArcProjects\Tranquillitatis\TBDeff_7.tif",
+    "19GHz": r"F:\ArcProjects\Tranquillitatis\TBDeff_19.tif",
+    "37GHz": r"F:\ArcProjects\Tranquillitatis\TBDeff_37.tif"
+}
+
+# Output folder for normalized rasters and masks
+out_folder = os.path.join(env.workspace, "Normalized")
+os.makedirs(out_folder, exist_ok=True)
+
+# Threshold for flagging extreme normalized values
+EXTREME_THRESHOLD = 5.0
+
+# Temporary in_memory workspace
+in_memory = "in_memory"
+
+# ------------------ CHECK EXTENSION ------------------
+# Ensure Spatial Analyst is available
+arcpy.CheckOutExtension("Spatial")
+
+#EXECUTABLE CODE
+
+"""
+normalize_tbdeff.py
+
+Compute robust per-channel normalisation (median / MAD) for TBDeff rasters
+and write normalized rasters TBDeff_*_norm.tif plus an optional extreme mask.
+
+Requirements:
+ - ArcGIS Pro / ArcPy (Python 3.x)
+ - Spatial Analyst extension
+
+Edit the USER PARAMETERS section below to match your paths and filenames.
+"""
+
+import arcpy
+import os
+import numpy as np
+
+from arcpy import env
+from arcpy.sa import Con
+
+# ------------------ USER PARAMETERS ------------------
+env.workspace = r"F:\ArcProjects\Tranquillitatis"
+env.overwriteOutput = True
+
+# Input TBDeff rasters (full paths or relative to workspace)
+input_rasters = {
+    "3GHz":  r"F:\ArcProjects\Tranquillitatis\TBDeff_3.tif",
+    "7GHz":  r"F:\ArcProjects\Tranquillitatis\TBDeff_7.tif",
+    "19GHz": r"F:\ArcProjects\Tranquillitatis\TBDeff_19.tif",
+    "37GHz": r"F:\ArcProjects\Tranquillitatis\TBDeff_37.tif"
+}
+
+# Output folder for normalized rasters and masks
+out_folder = os.path.join(env.workspace, "Normalized")
+os.makedirs(out_folder, exist_ok=True)
+
+# Threshold for flagging extremes in normalized units
+EXTREME_THRESHOLD = 5.0
+
+# Temporary in_memory workspace
+in_memory = "in_memory"
+
+# ------------------ CHECK EXTENSION ------------------
+arcpy.CheckOutExtension("Spatial")
+
+# ------------------ HELPER FUNCTIONS ------------------
+def raster_to_array(raster_path):
+    """Return (array, lower_left, cellsize, nodata) for a raster."""
+    r = arcpy.Raster(raster_path)
+    arr = arcpy.RasterToNumPyArray(r, nodata_to_value=np.nan)
+    lower_left = (r.extent.XMin, r.extent.YMin)
+    cellsize = r.meanCellWidth
+    nodata = r.noDataValue
+    return arr.astype(float), lower_left, cellsize, nodata
+
+def array_to_raster(arr, template_raster_path, out_path, nodata_value=np.nan):
+    """Write a numpy array to a raster using a template raster for georeference."""
+    # Replace NaNs with nodata_value for writing
+    arr_write = np.array(arr)
+    if np.isnan(nodata_value):
+        # ArcPy expects a numeric nodata; choose a sentinel if necessary
+        nodata_value = -9999.0
+    arr_write[np.isnan(arr_write)] = nodata_value
+
+    # Use RasterToNumPyArray shape: (rows, cols) -> arcpy expects same
+    lower_left = arcpy.Raster(template_raster_path).extent.lowerLeft
+    cellsize = arcpy.Raster(template_raster_path).meanCellWidth
+    sr = arcpy.Describe(template_raster_path).spatialReference
+
+    # Create raster from numpy array
+    out_raster = arcpy.NumPyArrayToRaster(arr_write,
+                                          lower_left,
+                                          cellsize,
+                                          cellsize,
+                                          value_to_nodata=nodata_value)
+    arcpy.DefineProjection_management(out_raster, sr)
+    out_raster.save(out_path)
+    return out_path
+
+# ------------------ MAIN PROCESS ------------------
+summary = {}
+
+for label, raster_path in input_rasters.items():
+    print(f"Processing {label}: {raster_path}")
+    if not arcpy.Exists(raster_path):
+        print(f"  ERROR: raster not found: {raster_path}")
+        continue
+
+    # Read raster to numpy array (NaNs for NoData)
+    arr, ll, cs, nodata = raster_to_array(raster_path)
+
+    # Flatten and ignore NaNs for robust stats
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        print(f"  WARNING: no valid pixels in {raster_path}")
+        continue
+
+    # Compute median and MAD (median absolute deviation)
+    median = np.median(valid)
+    mad = np.median(np.abs(valid - median))
+
+    # Scale factor to make MAD comparable to std dev for normal dist
+    scale = 1.4826
+    mad_scaled = mad * scale if mad > 0 else 0.0
+
+    # Compute normalized array: (value - median) / (1.4826 * MAD)
+    norm_arr = (arr - median) / (mad_scaled if mad_scaled > 0 else 1.0)
+    # Preserve NoData as NaN
+    norm_arr[np.isnan(arr)] = np.nan
+
+    # Flag extremes (> EXTREME_THRESHOLD)
+    extreme_mask = np.zeros_like(norm_arr, dtype=np.uint8)
+    extreme_mask[~np.isnan(norm_arr) & (np.abs(norm_arr) > EXTREME_THRESHOLD)] = 1
+
+    # Output filenames
+    base = os.path.splitext(os.path.basename(raster_path))[0]
+    out_norm = os.path.join(out_folder, f"{base}_norm.tif")
+    out_mask = os.path.join(out_folder, f"{base}_extreme_mask.tif")
+
+    # Write normalized raster and mask
+    print(f"  Writing normalized raster: {out_norm}")
+    array_to_raster(norm_arr, raster_path, out_norm, nodata_value=-9999.0)
+
+    print(f"  Writing extreme mask: {out_mask}")
+    array_to_raster(extreme_mask, raster_path, out_mask, nodata_value=0)
+
+    # Record summary stats
+    summary[label] = {
+        "input": raster_path,
+        "output_norm": out_norm,
+        "output_mask": out_mask,
+        "median": float(median),
+        "mad": float(mad),
+        "mad_scaled": float(mad_scaled),
+        "n_valid_pixels": int(valid.size)
+    }
+
+# ------------------ WRITE SUMMARY CSV ------------------
+import json
+summary_path = os.path.join(out_folder, "normalisation_summary.json")
+with open(summary_path, "w") as fh:
+    json.dump(summary, fh, indent=2)
+
+print("Normalization complete. Summary written to:", summary_path)
